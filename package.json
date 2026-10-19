@@ -1,0 +1,16 @@
+{
+  "name": "clearpage",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ClearPage: a private, watermark-free document scanner that runs in the browser.",
+  "type": "module",
+  "scripts": {
+    "serve": "node tools/serve.mjs",
+    "test": "node tests/run-tests.mjs",
+    "photos": "py -3.14 tests/make_photos.py"
+  },
+  "devDependencies": {
+    "jpeg-js": "^0.4.4",
+    "pngjs": "^7.0.0"
+  }
+}
