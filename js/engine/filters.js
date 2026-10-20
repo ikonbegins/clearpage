@@ -21,25 +21,45 @@ const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
 // ---------- background estimation ----------
 
 // Works on one channel of an interleaved array (stride 4 for RGBA, 1 for gray).
-// 1. Shrink by taking the brightest pixel of each block: ink is dark, so the block max is paper.
-// 2. A "closing" on the small image (grow bright areas, then shrink them back) removes bigger
-//    dark things like bold marker, but puts the edge of a shadow back where it really is.
+// 1. Shrink to small blocks, keeping a high-ish percentile of each block. (The brightest
+//    pixel would be easier, but in a grainy shadow the brightest pixel is a grain spike,
+//    which made shadowed paper come out grey.)
+// 2. A "closing" on the small image (grow bright areas, then shrink them back) replaces
+//    blocks full of ink by their paper neighbours, but puts the edge of a shadow back
+//    where it really is.
 // 3. A light blur gives a smooth lighting map.
 // The map is fine (about 1/320 of the page) so the edge of a hard shadow lands in the right
 // place instead of leaving a grey line along it.
+const BG_PERCENTILE = 0.6;
 function estimateBackground(arr, stride, offset, w, h) {
   const block = Math.max(2, Math.round(Math.max(w, h) / 320));
   const sw = Math.ceil(w / block), sh = Math.ceil(h / block);
   let small = new Float32Array(sw * sh);
   const bxOf = new Int32Array(w);
   for (let x = 0; x < w; x++) bxOf[x] = (x / block) | 0;
-  for (let y = 0; y < h; y++) {
-    const rowBase = ((y / block) | 0) * sw;
-    let i = (y * w) * stride + offset;
-    for (let x = 0; x < w; x++, i += stride) {
-      const v = arr[i];
-      const k = rowBase + bxOf[x];
-      if (v > small[k]) small[k] = v;
+  // One band of blocks at a time: a 64-bin histogram per block (values / 4).
+  const hist = new Uint16Array(sw * 64);
+  const counts = new Uint16Array(sw);
+  for (let by = 0; by < sh; by++) {
+    hist.fill(0);
+    counts.fill(0);
+    const y1 = Math.min(h, (by + 1) * block);
+    for (let y = by * block; y < y1; y++) {
+      let i = (y * w) * stride + offset;
+      for (let x = 0; x < w; x++, i += stride) {
+        const b = bxOf[x];
+        hist[b * 64 + (arr[i] >> 2)]++;
+        counts[b]++;
+      }
+    }
+    for (let b = 0; b < sw; b++) {
+      const target = counts[b] * BG_PERCENTILE;
+      let acc = 0, bin = 0;
+      for (; bin < 64; bin++) {
+        acc += hist[b * 64 + bin];
+        if (acc >= target) break;
+      }
+      small[by * sw + b] = bin * 4 + 2;
     }
   }
   small = minFilter(maxFilter(small, sw, sh, 3), sw, sh, 3);
@@ -303,6 +323,40 @@ function sharpenOrSmooth(L, w, h, amount, noise) {
   L.set(out);
 }
 
+// 3x3 median, only where the paper is grainy. The middle of 9 values ignores single
+// noisy pixels but keeps any line or stroke at least 2 pixels wide, so paper lines and
+// pencil survive (a blur would smear them, and lowering the white level would erase them).
+function medianWhereGrainy(L, w, h, noise, from = 3, full = 7) {
+  const sample = sampler(noise, w);
+  const up = upsampler(noise, w);
+  const out = new Uint8Array(L);
+  const v = new Int32Array(9);
+  const sw = (a, b) => {
+    if (v[a] > v[b]) {
+      const t = v[a];
+      v[a] = v[b];
+      v[b] = t;
+    }
+  };
+  for (let y = 1; y < h - 1; y++) {
+    const row = up.row(y);
+    for (let x = 1; x < w - 1; x++) {
+      const g = sample(x, row);
+      if (g <= from) continue;
+      const i = y * w + x;
+      v[0] = L[i - w - 1]; v[1] = L[i - w]; v[2] = L[i - w + 1];
+      v[3] = L[i - 1]; v[4] = L[i]; v[5] = L[i + 1];
+      v[6] = L[i + w - 1]; v[7] = L[i + w]; v[8] = L[i + w + 1];
+      // Sorting network that leaves the median of 9 in v[4] (Paeth / Devillard, 19 swaps).
+      sw(1, 2); sw(4, 5); sw(7, 8); sw(0, 1); sw(3, 4); sw(6, 7); sw(1, 2); sw(4, 5); sw(7, 8);
+      sw(0, 3); sw(5, 8); sw(4, 7); sw(3, 6); sw(1, 4); sw(2, 5); sw(4, 7); sw(4, 2); sw(6, 4); sw(4, 2);
+      const a = Math.min(1, (g - from) / (full - from));
+      out[i] = L[i] + (v[4] - L[i]) * a;
+    }
+  }
+  L.set(out);
+}
+
 function writeGray(img, L, lut) {
   const d = img.data;
   for (let i = 0, j = 0; i < L.length; i++, j += 4) {
@@ -352,11 +406,13 @@ function grayEnhance(img, s, shadows, mode) {
   const ink = pct(hist, L.length, 0.005);
   let white, gamma, sharpen;
   if (mode === 'clean') {
-    white = paper * (0.93 - 0.07 * s);
-    gamma = 1 + 1.0 * s;
+    // White level high enough that light blue paper lines (about 80% of the paper's
+    // brightness) stay visible; gamma darkens the middle tones so pencil reads clearly.
+    white = paper * (0.955 - 0.03 * s);
+    gamma = 1 + 0.8 * s;
     sharpen = 0.4 + 0.6 * s;
   } else if (mode === 'inksaver') {
-    white = paper * 0.88;
+    white = paper * 0.93;
     gamma = 1;
     sharpen = 0.3;
   } else {
@@ -365,14 +421,15 @@ function grayEnhance(img, s, shadows, mode) {
     sharpen = 0.25 + 0.25 * s;
   }
   const black = Math.min(ink, white - 60);
+  // Grain first (median), then sharpen the clean areas only.
+  medianWhereGrainy(L, w, h, noiseMap(L, w, h, paper));
   sharpenOrSmooth(L, w, h, sharpen, noiseMap(L, w, h, paper));
-  // Where the paper is still grainy (usually a brightened shadow), lower the white point by
-  // about 3x the grain, so the grain turns white too. Ink is far darker, so it stays.
-  const k = mode === 'gray' ? 2 : 3;
+  // Any grain that is left may lower the white level a little, never more than 4% of the
+  // paper, so paper lines and light pencil can never be pushed to white.
   const noise = noiseMap(L, w, h, paper);
   const sample = sampler(noise, w);
   const up = upsampler(noise, w);
-  const lowest = Math.max(black + 60, paper * 0.62);
+  const lowest = white - paper * 0.04;
   const keep = 0.75 - 0.3 * s;
   const luts = new Map();
   const lutFor = (wp) => {
@@ -388,30 +445,20 @@ function grayEnhance(img, s, shadows, mode) {
   for (let y = 0; y < h; y++) {
     const row = up.row(y);
     for (let x = 0, i = y * w; x < w; x++, i++) {
-      const wp = Math.round(Math.max(lowest, Math.min(white, paper - k * sample(x, row))));
+      const wp = Math.round(Math.max(lowest, Math.min(white, paper - 1.5 * sample(x, row))));
       L[i] = lutFor(wp)[L[i]];
     }
   }
-  // Despeckle (Clean and Ink saver): a light grey dot with at most one non-white neighbour
-  // is leftover grain. Two passes also catch pairs. Pen and pencil marks are larger or darker.
+  // Despeckle (Clean and Ink saver): only a single grey pixel with no grey neighbour at all.
+  // Lines and strokes always have neighbours, so they are never touched.
   if (mode !== 'gray') {
-    for (let pass = 0; pass < 2; pass++) {
-      for (let y = 1; y < h - 1; y++) {
-        for (let x = 1; x < w - 1; x++) {
-          const i = y * w + x;
-          const v = L[i];
-          if (v >= 250 || v < 110) continue;
-          let nb = 0;
-          if (L[i - w - 1] < 250) nb++;
-          if (L[i - w] < 250) nb++;
-          if (L[i - w + 1] < 250) nb++;
-          if (L[i - 1] < 250) nb++;
-          if (L[i + 1] < 250) nb++;
-          if (L[i + w - 1] < 250) nb++;
-          if (L[i + w] < 250) nb++;
-          if (L[i + w + 1] < 250) nb++;
-          if (nb <= 1) L[i] = 255;
-        }
+    for (let y = 1; y < h - 1; y++) {
+      for (let x = 1; x < w - 1; x++) {
+        const i = y * w + x;
+        if (L[i] >= 250) continue;
+        if (L[i - w - 1] < 250 || L[i - w] < 250 || L[i - w + 1] < 250 || L[i - 1] < 250 ||
+          L[i + 1] < 250 || L[i + w - 1] < 250 || L[i + w] < 250 || L[i + w + 1] < 250) continue;
+        L[i] = 255;
       }
     }
   }

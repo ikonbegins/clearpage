@@ -44,7 +44,7 @@ export const tests = [
     },
   },
   {
-    name: 'deep, hard shadows become evenly white paper with the Clean filter',
+    name: 'deep, hard shadows leave no dark area with the Clean filter, even with heavy grain',
     fn() {
       const answers = JSON.parse(fs.readFileSync(path.join(dir, 'photos', 'answers.json'), 'utf8')).filter((a) => a.category === 'deep_shadow');
       assert.ok(answers.length, 'run "npm run photos" first');
@@ -75,7 +75,10 @@ export const tests = [
       console.log(`       darkest paper tile / white share: ${worst.map((w) => `${w.file.slice(0, 3)}:${w.minTile}/${(w.share * 100).toFixed(0)}%`).join('  ')}`);
       for (const w of worst) {
         assert.ok(w.minTile >= 230, `${w.file}: a shadowed part of the paper is still grey (${w.minTile})`);
-        assert.ok(w.share > 0.7, `${w.file}: only ${(w.share * 100).toFixed(0)}% white paper`);
+        // These photos have far more grain than an iPhone photo, and the filter now keeps
+        // paper lines and some grain rather than risk erasing writing (homework.test.mjs
+        // checks lines, pencil and white paper strictly at realistic grain).
+        assert.ok(w.share > 0.45, `${w.file}: only ${(w.share * 100).toFixed(0)}% white paper`);
       }
     },
   },
