@@ -15,7 +15,7 @@ import sys
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageChops
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-OUT = os.path.join(HERE, "photos")
+OUT = os.environ.get("PHOTOS_DIR") or os.path.join(HERE, "photos")
 FONTS = "C:/Windows/Fonts/"
 HAND_FONTS = ["Inkfree.ttf", "segoesc.ttf", "BRADHITC.TTF", "comic.ttf"]
 PRINT_FONTS = ["arial.ttf", "times.ttf", "consola.ttf"]
@@ -174,7 +174,7 @@ def place_quad(frame, page_size, rnd, steep=False, rot45=False, partial=False):
     return pts
 
 
-def lighting(img, rnd, shadow=False, low=False):
+def lighting(img, rnd, shadow=False, low=False, deep=False):
     W, H = img.size
     grad = Image.linear_gradient("L").resize((W, H)).rotate(rnd.uniform(0, 360), expand=False, fillcolor=128)
     lo, hi = (90, 170) if low else (185, 255)
@@ -185,8 +185,10 @@ def lighting(img, rnd, shadow=False, low=False):
         d = ImageDraw.Draw(m)
         x0 = rnd.uniform(0.1, 0.5) * W
         y0 = rnd.uniform(-0.2, 0.3) * H
-        d.polygon([(x0, y0), (x0 + W * 0.7, y0 + H * 0.1), (x0 + W * 0.5, y0 + H * 0.8), (x0 - W * 0.2, y0 + H * 0.6)], fill=rnd.randint(120, 170))
-        m = m.filter(ImageFilter.GaussianBlur(rnd.uniform(15, 50)))
+        # Deep shadows are like a phone or arm blocking a desk lamp: 3 to 4 times darker, sharp edge.
+        level = rnd.randint(55, 95) if deep else rnd.randint(120, 170)
+        d.polygon([(x0, y0), (x0 + W * 0.7, y0 + H * 0.1), (x0 + W * 0.5, y0 + H * 0.8), (x0 - W * 0.2, y0 + H * 0.6)], fill=level)
+        m = m.filter(ImageFilter.GaussianBlur(rnd.uniform(4, 14) if deep else rnd.uniform(15, 50)))
         out = ImageChops.multiply(out, Image.merge("RGB", [m, m, m]))
     return out
 
@@ -205,9 +207,14 @@ def make(index, category, rnd):
     bg_kind = {"dark_desk": "dark", "wood": "wood", "white_on_white": "white", "pattern": "pattern",
                "shadow": rnd.choice(["dark", "wood", "carpet"]), "finger": rnd.choice(["dark", "wood"]),
                "steep": rnd.choice(["dark", "wood", "carpet"]), "low_light": rnd.choice(["dark", "carpet"]),
-               "rotated": rnd.choice(["dark", "wood"]), "partial": "dark"}[category]
+               "rotated": rnd.choice(["dark", "wood"]), "partial": "dark",
+               "deep_shadow": rnd.choice(["dark", "wood", "carpet"])}[category]
     kind = rnd.choices(["homework", "printed", "receipt"], [0.6, 0.3, 0.1])[0]
     page = make_page(kind, rnd)
+    if category == "deep_shadow":
+        # Writing on the back of thin paper shows through faintly, mirrored.
+        back = make_page("homework", rnd).resize(page.size).transpose(Image.FLIP_LEFT_RIGHT)
+        page = ImageChops.multiply(page, back.point(lambda v: int(255 - (255 - v) * 0.12)))
     scene = background(bg_kind, frame, rnd)
     quad = place_quad(frame, page.size, rnd, steep=category == "steep", rot45=category == "rotated", partial=category == "partial")
     src = [(0, 0), (page.width, 0), (page.width, page.height), (0, page.height)]
@@ -217,7 +224,7 @@ def make(index, category, rnd):
     scene.paste(warped, (0, 0), mask)
     if category == "finger":
         finger(scene, quad, rnd)
-    scene = lighting(scene, rnd, shadow=category == "shadow", low=category == "low_light")
+    scene = lighting(scene, rnd, shadow=category in ("shadow", "deep_shadow"), low=category == "low_light", deep=category == "deep_shadow")
     noise = Image.effect_noise(frame, 12 if category == "low_light" else 6).convert("RGB")
     # effect_noise is centred on 128, so subtract that to add zero-mean sensor noise.
     scene = ImageChops.add(scene, noise, scale=1.0, offset=-128 - (6 if category == "low_light" else 2))
@@ -232,7 +239,7 @@ def main():
     os.makedirs(OUT, exist_ok=True)
     rnd = random.Random(int(sys.argv[1]) if len(sys.argv) > 1 else 7)
     plan = [("dark_desk", 14), ("wood", 14), ("white_on_white", 10), ("pattern", 8), ("shadow", 12),
-            ("finger", 8), ("steep", 10), ("low_light", 8), ("rotated", 6), ("partial", 4)]
+            ("finger", 8), ("steep", 10), ("low_light", 8), ("rotated", 6), ("partial", 4), ("deep_shadow", 10)]
     answers = []
     i = 0
     for cat, n in plan:

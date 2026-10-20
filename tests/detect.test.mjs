@@ -9,7 +9,8 @@ import { quadIoU } from '../js/engine/geometry.js';
 import { loadJpeg, resize, drawQuad, savePng } from './imgutil.mjs';
 
 const dir = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
-const photos = path.join(dir, 'photos');
+// PHOTOS_DIR lets you grade another photo set, for example one made with a different seed.
+const photos = process.env.PHOTOS_DIR || path.join(dir, 'photos');
 const outDir = path.join(dir, 'out');
 
 export const tests = [

@@ -6,7 +6,8 @@ import { getRenderer } from '../engine/client.js';
 import { blobToCanvas, canvasPixels, canvasToBlob, pixelsToCanvas, releaseCanvas, thumbnailFromCanvas, ORIGINAL_MAX_SIDE } from './imageio.js';
 
 // Bump when the engine changes in a way that should re-render existing pages.
-export const ENGINE_VERSION = 1;
+// 2: stronger shadow removal, grain-aware white point and despeckle.
+export const ENGINE_VERSION = 2;
 // Long side of the stored page image. Letter paper at about 290 dpi.
 export const RENDER_MAX_SIDE = 3200;
 

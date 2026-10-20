@@ -3,3 +3,4 @@ tests/photos/*.jpg
 tests/photos/answers.json
 tests/out/
 .claude/
+tests/photos_s*/

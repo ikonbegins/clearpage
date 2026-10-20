@@ -710,7 +710,7 @@ function runPass(ctx, lo, hi) {
 
 export function detectPage(img, opts = {}) {
   const { width: w, height: h } = img;
-  const minArea = opts.minArea ?? 0.12;
+  const minArea = opts.minArea ?? 0.08;
   const g = blur5(toGray(img), w, h);
   const { gx, gy, mag } = sobel(g, w, h);
   const reach = Math.max(2, Math.round(Math.hypot(w, h) / 300));
@@ -724,8 +724,8 @@ export function detectPage(img, opts = {}) {
   if (!res.best || res.best.support < 0.75 || res.best.ext > 0.25) {
     const hi2 = Math.max(12, hi1 * 0.4);
     const res2 = runPass(ctx, hi2 * 0.45, hi2);
-    if (opts.forceSecondPass || (res2.best && (!res.best || res2.best.score * 0.95 > res.best.score))) {
-      if (res2.best) res2.best.score *= 0.95;
+    if (opts.forceSecondPass || (res2.best && (!res.best || res2.best.score * 0.98 > res.best.score))) {
+      if (res2.best) res2.best.score *= 0.98;
       res = { ...res2, tried: res.tried.concat(res2.tried) };
     }
   }

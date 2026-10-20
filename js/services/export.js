@@ -8,8 +8,8 @@ import { safeFileName } from './share.js';
 // Long side in pixels and JPEG quality for each preset. "High" keeps the stored page image as is.
 export const QUALITY = {
   high: { label: 'High', maxSide: 3200, q: null },
-  medium: { label: 'Medium', maxSide: 2200, q: 0.8 },
-  small: { label: 'Small', maxSide: 1500, q: 0.62 },
+  medium: { label: 'Medium', maxSide: 2600, q: 0.85 },
+  small: { label: 'Small', maxSide: 1800, q: 0.72 },
 };
 
 // Steps from best to smallest, used to hit a target file size.

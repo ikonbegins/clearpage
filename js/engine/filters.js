@@ -25,8 +25,10 @@ const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
 // 2. A "closing" on the small image (grow bright areas, then shrink them back) removes bigger
 //    dark things like bold marker, but puts the edge of a shadow back where it really is.
 // 3. A light blur gives a smooth lighting map.
+// The map is fine (about 1/320 of the page) so the edge of a hard shadow lands in the right
+// place instead of leaving a grey line along it.
 function estimateBackground(arr, stride, offset, w, h) {
-  const block = Math.max(2, Math.round(Math.max(w, h) / 200));
+  const block = Math.max(2, Math.round(Math.max(w, h) / 320));
   const sw = Math.ceil(w / block), sh = Math.ceil(h / block);
   let small = new Float32Array(sw * sh);
   const bxOf = new Int32Array(w);
@@ -40,13 +42,14 @@ function estimateBackground(arr, stride, offset, w, h) {
       if (v > small[k]) small[k] = v;
     }
   }
-  small = minFilter(maxFilter(small, sw, sh, 2), sw, sh, 2);
-  small = boxBlur(boxBlur(small, sw, sh, 1), sw, sh, 1);
-  // Never brighten a spot more than about 2x. Big genuinely dark areas (a photo printed
-  // on the page, the desk at the border) should stay dark, not turn grey-white.
+  small = minFilter(maxFilter(small, sw, sh, 3), sw, sh, 3);
+  small = boxBlur(small, sw, sh, 1);
+  // Limit brightening to about 8x. A phone or arm blocking a desk lamp easily makes paper
+  // 3 to 4 times darker, and that must still come out white. Only near-black areas
+  // (darker than 12% of the lit paper) are treated as genuinely dark and left alone.
   const sorted = Float32Array.from(small).sort();
   const paper = sorted[Math.floor(sorted.length * 0.9)] || 255;
-  const floor = paper * 0.45;
+  const floor = paper * 0.12;
   for (let i = 0; i < small.length; i++) if (small[i] < floor) small[i] = floor;
   return { small, sw, sh, block, paper };
 }
@@ -169,6 +172,48 @@ function normalizeGray(L, w, h) {
   }
 }
 
+// ---------- noise map ----------
+
+// How grainy the paper is in each part of the page. Brightening a shadow 4x also makes the
+// camera's grain 4x stronger, so shadowed areas are much noisier than lit ones.
+// Per block we average |pixel - mean of its 4 neighbours| over paper pixels only (not ink),
+// which for random grain is about 0.9 x its standard deviation.
+function noiseMap(L, w, h, paper) {
+  const block = Math.max(8, Math.round(Math.max(w, h) / 60));
+  const sw = Math.ceil(w / block), sh = Math.ceil(h / block);
+  const sum = new Float32Array(sw * sh), cnt = new Float32Array(sw * sh);
+  const minPaper = paper * 0.7;
+  for (let y = 1; y < h - 1; y += 2) {
+    const row = ((y / block) | 0) * sw;
+    for (let x = 1; x < w - 1; x += 2) {
+      const i = y * w + x;
+      const v = L[i];
+      if (v < minPaper) continue;
+      const n = (L[i - 1] + L[i + 1] + L[i - w] + L[i + w]) / 4;
+      if (n < minPaper) continue; // next to ink: the difference is the stroke, not grain
+      const k = row + ((x / block) | 0);
+      sum[k] += Math.abs(v - n);
+      cnt[k]++;
+    }
+  }
+  let small = new Float32Array(sw * sh);
+  for (let k = 0; k < small.length; k++) small[k] = cnt[k] > 20 ? (1.12 * sum[k]) / cnt[k] : 0;
+  // Blocks with no paper (all ink) borrow from their neighbours.
+  small = boxBlur(maxFilter(small, sw, sh, 1), sw, sh, 1);
+  return { small, sw, sh, block };
+}
+
+// Bilinear lookup of a small map at full-size pixel (x, y).
+function sampler(map, w) {
+  const up = upsampler(map, w);
+  const s = map.small;
+  return (x, rowInfo) => {
+    const fx = up.fx[x];
+    return s[rowInfo.r0 + up.x0[x]] * (1 - fx) * (1 - rowInfo.fy) + s[rowInfo.r0 + up.x1[x]] * fx * (1 - rowInfo.fy) +
+      s[rowInfo.r1 + up.x0[x]] * (1 - fx) * rowInfo.fy + s[rowInfo.r1 + up.x1[x]] * fx * rowInfo.fy;
+  };
+}
+
 // ---------- helpers ----------
 
 function luminance(img) {
@@ -228,6 +273,34 @@ function blurGray(L, w, h) {
     for (let x = 0; x < w; x++) out[mid + x] = (tmp[up + x] + tmp[mid + x] + tmp[dn + x] + 4) / 9;
   }
   return out;
+}
+
+// Like sharpenGray, but it looks at the grain map first: clean areas get sharpened,
+// grainy areas (brightened shadows) do not, because sharpening grain makes it stronger.
+// (Smoothing grainy areas was tried too; it turns fine grain into blotches that are
+// harder to remove, so they are just left alone.)
+function sharpenOrSmooth(L, w, h, amount, noise) {
+  const tmp = new Uint16Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const r = y * w;
+    for (let x = 0; x < w; x++) tmp[r + x] = L[r + (x > 0 ? x - 1 : x)] + L[r + x] + L[r + (x < w - 1 ? x + 1 : x)];
+  }
+  const sample = sampler(noise, w);
+  const up = upsampler(noise, w);
+  const out = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    const row = up.row(y);
+    const u = (y > 0 ? y - 1 : y) * w, m = y * w, dn = (y < h - 1 ? y + 1 : y) * w;
+    for (let x = 0; x < w; x++) {
+      const grain = clamp01((sample(x, row) - 3) / 8);
+      const a = amount * (1 - grain);
+      const v = L[m + x];
+      const blur = (tmp[u + x] + tmp[m + x] + tmp[dn + x]) / 9;
+      const o = v + a * (v - blur);
+      out[m + x] = o < 0 ? 0 : o > 255 ? 255 : o;
+    }
+  }
+  L.set(out);
 }
 
 function writeGray(img, L, lut) {
@@ -292,14 +365,57 @@ function grayEnhance(img, s, shadows, mode) {
     sharpen = 0.25 + 0.25 * s;
   }
   const black = Math.min(ink, white - 60);
-  sharpenGray(L, w, h, sharpen);
-  const lut = levelsLut(black, white, gamma);
-  if (mode === 'inksaver') {
-    // Keep text readable but print it as dark grey instead of solid black.
-    const keep = 0.75 - 0.3 * s;
-    for (let v = 0; v < 256; v++) lut[v] = 255 - (255 - lut[v]) * keep;
+  sharpenOrSmooth(L, w, h, sharpen, noiseMap(L, w, h, paper));
+  // Where the paper is still grainy (usually a brightened shadow), lower the white point by
+  // about 3x the grain, so the grain turns white too. Ink is far darker, so it stays.
+  const k = mode === 'gray' ? 2 : 3;
+  const noise = noiseMap(L, w, h, paper);
+  const sample = sampler(noise, w);
+  const up = upsampler(noise, w);
+  const lowest = Math.max(black + 60, paper * 0.62);
+  const keep = 0.75 - 0.3 * s;
+  const luts = new Map();
+  const lutFor = (wp) => {
+    let lut = luts.get(wp);
+    if (!lut) {
+      lut = levelsLut(black, wp, gamma);
+      // Ink saver prints text as dark grey instead of solid black.
+      if (mode === 'inksaver') for (let v = 0; v < 256; v++) lut[v] = 255 - (255 - lut[v]) * keep;
+      luts.set(wp, lut);
+    }
+    return lut;
+  };
+  for (let y = 0; y < h; y++) {
+    const row = up.row(y);
+    for (let x = 0, i = y * w; x < w; x++, i++) {
+      const wp = Math.round(Math.max(lowest, Math.min(white, paper - k * sample(x, row))));
+      L[i] = lutFor(wp)[L[i]];
+    }
   }
-  writeGray(img, L, lut);
+  // Despeckle (Clean and Ink saver): a light grey dot with at most one non-white neighbour
+  // is leftover grain. Two passes also catch pairs. Pen and pencil marks are larger or darker.
+  if (mode !== 'gray') {
+    for (let pass = 0; pass < 2; pass++) {
+      for (let y = 1; y < h - 1; y++) {
+        for (let x = 1; x < w - 1; x++) {
+          const i = y * w + x;
+          const v = L[i];
+          if (v >= 250 || v < 110) continue;
+          let nb = 0;
+          if (L[i - w - 1] < 250) nb++;
+          if (L[i - w] < 250) nb++;
+          if (L[i - w + 1] < 250) nb++;
+          if (L[i - 1] < 250) nb++;
+          if (L[i + 1] < 250) nb++;
+          if (L[i + w - 1] < 250) nb++;
+          if (L[i + w] < 250) nb++;
+          if (L[i + w + 1] < 250) nb++;
+          if (nb <= 1) L[i] = 255;
+        }
+      }
+    }
+  }
+  writeGray(img, L, null);
   return img;
 }
 
@@ -313,15 +429,11 @@ function blackWhite(img, s, shadows) {
   const paper = pct(histogram(raw), raw.length, 0.9);
   // Smooth a little first, so camera noise on the paper does not turn into black speckles.
   const L = blurGray(raw, w, h);
-  // Measure the noise that is left on the paper and keep the threshold above it.
-  let dev = 0, n = 0;
-  for (let i = 0; i < L.length; i += 7) {
-    if (L[i] > paper * 0.8) {
-      dev += Math.abs(raw[i] - L[i]);
-      n++;
-    }
-  }
-  const noise = n ? (1.25 * dev) / n / 3 : 0;
+  // Measure the grain in each part of the page and keep the threshold above it there.
+  // (After the 3x3 smoothing the grain is about 3 times weaker.)
+  const noise = noiseMap(raw, w, h, paper);
+  const sample = sampler(noise, w);
+  const up = upsampler(noise, w);
   const r = Math.max(4, Math.round(Math.max(w, h) / 100));
   const W1 = w + 1;
   const sum = new Uint32Array(W1 * (h + 1));
@@ -332,14 +444,16 @@ function blackWhite(img, s, shadows) {
       sum[(y + 1) * W1 + x + 1] = sum[y * W1 + x + 1] + row;
     }
   }
-  const C = Math.max(255 * (0.1 - 0.07 * s), 4 * noise);
+  const C0 = 255 * (0.1 - 0.07 * s);
   const dark = paper * 0.55;
   const sure = paper * 0.95;
   // ink[i] is 0 (paper) to 255 (ink); the reuse of `raw` saves a big allocation.
   const ink = raw;
   for (let y = 0; y < h; y++) {
     const ya = Math.max(0, y - r), yb = Math.min(h, y + r + 1);
+    const row = up.row(y);
     for (let x = 0; x < w; x++) {
+      const C = Math.max(C0, (4 / 3) * sample(x, row));
       const xa = Math.max(0, x - r), xb = Math.min(w, x + r + 1);
       const area = (yb - ya) * (xb - xa);
       const total = sum[yb * W1 + xb] - sum[ya * W1 + xb] - sum[yb * W1 + xa] + sum[ya * W1 + xa];
